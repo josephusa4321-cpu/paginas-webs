@@ -1,253 +1,270 @@
 """
 Encuentra restaurantes y locales en Medellín que tienen Instagram pero NO tienen página web.
-Fuente: Google Maps (búsqueda web scraping)
+Fuente principal: Google Maps (via Patchright browser) + búsqueda de Instagram por nombre.
 """
 
 import time
 import json
 import re
 import csv
-from scrapling.fetchers import Fetcher, StealthyFetcher
 
-SEARCH_QUERIES = [
-    "restaurantes Medellín Colombia instagram",
-    "cafeterias Medellín Colombia instagram",
-    "bares Medellín Colombia instagram",
-    "comidas rapidas Medellín Colombia instagram",
-    "pizzerias Medellín Colombia instagram",
+from patchright.sync_api import sync_playwright
+from scrapling.fetchers import Fetcher
+
+# ─── Configuración ────────────────────────────────────────────────────────────
+
+SEARCH_QUERIES_MAPS = [
+    "restaurantes medellin colombia",
+    "cafeterias medellin colombia",
+    "bares medellin colombia",
+    "comida rapida medellin colombia",
+    "pizzerias medellin colombia",
+    "heladerias medellin colombia",
+    "pastelerias medellin colombia",
 ]
 
-INSTAGRAM_PATTERN = re.compile(r'instagram\.com/([A-Za-z0-9_.]+)', re.IGNORECASE)
-WEBSITE_KEYWORDS = ['.com', '.co', '.net', '.org', '.io', '.co.co']
+SCROLL_ROUNDS = 12       # cuántas veces hacer scroll en el feed de Maps
+DELAY_BETWEEN = 1.2      # segundos entre scrolls
+
+OUTPUT_CSV  = "resultados.csv"
+OUTPUT_JSON = "resultados.json"
 
 
-def has_instagram(text: str) -> str | None:
-    """Retorna el handle de Instagram si existe en el texto."""
-    match = INSTAGRAM_PATTERN.search(text)
-    if match:
-        return match.group(0)
-    return None
+# ─── Utilidades ───────────────────────────────────────────────────────────────
+
+INSTAGRAM_RE = re.compile(r'instagram\.com/([A-Za-z0-9_.]{3,30})', re.I)
+SOCIAL_DOMAINS = ('instagram.com', 'facebook.com', 'twitter.com',
+                  'tiktok.com', 'youtube.com', 'linkedin.com', 'wa.me',
+                  'whatsapp.com', 'linktr.ee', 't.me')
 
 
-def has_website(text: str) -> bool:
-    """Detecta si el texto menciona una página web propia (no instagram/facebook)."""
-    social_domains = ('instagram.com', 'facebook.com', 'twitter.com', 'tiktok.com',
-                      'youtube.com', 'linkedin.com', 'whatsapp.com')
-    urls = re.findall(r'https?://[^\s"\'<>]+', text, re.IGNORECASE)
-    for url in urls:
-        lower = url.lower()
-        if not any(s in lower for s in social_domains):
-            return True
-    return False
+def _is_own_website(url: str) -> bool:
+    """True si la URL parece ser un sitio web propio (no red social ni Google)."""
+    lower = url.lower()
+    if 'google.' in lower or not url.startswith('http'):
+        return False
+    return not any(s in lower for s in SOCIAL_DOMAINS)
 
 
-def scrape_google_maps_search(query: str) -> list[dict]:
-    """Extrae resultados de búsqueda de Google para locales con Instagram."""
-    results = []
-    search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}&num=20"
+def find_instagram(text: str) -> str:
+    m = INSTAGRAM_RE.search(text)
+    return f"https://www.instagram.com/{m.group(1)}/" if m else ""
+
+
+# ─── Fase 1: Google Maps → lista de locales ───────────────────────────────────
+
+def scrape_maps_listings(playwright_page, query: str) -> list[dict]:
+    """
+    Busca `query` en Google Maps, hace scroll para cargar resultados y
+    visita cada listing para extraer website e Instagram.
+    """
+    url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
+    playwright_page.goto(url, wait_until='domcontentloaded', timeout=25000)
 
     try:
-        page = StealthyFetcher.fetch(search_url, headless=True, network_idle=True)
+        playwright_page.wait_for_selector('div[role="feed"]', timeout=12000)
     except Exception:
-        # Fallback a Fetcher básico si StealthyFetcher falla
-        page = Fetcher.get(search_url)
+        print(f"  [!] Feed no encontrado para: {query}")
+        return []
 
-    # Extraer bloques de resultados orgánicos
-    for result in page.css('div.g, div[data-ved]'):
-        text = result.get_text(separator=' ')
-        link_tags = result.css('a[href]')
-        href = ''
-        for a in link_tags:
-            h = a.attrib.get('href', '')
-            if h.startswith('http') and 'google.com' not in h:
-                href = h
-                break
+    feed = playwright_page.query_selector('div[role="feed"]')
+    for _ in range(SCROLL_ROUNDS):
+        feed.press('End')
+        time.sleep(DELAY_BETWEEN)
 
-        instagram_url = has_instagram(text) or has_instagram(href)
-        if not instagram_url:
-            continue
+    playwright_page.wait_for_timeout(2000)
+    anchors = playwright_page.query_selector_all('div[role="feed"] > div > div > a')
+    print(f"  -> {len(anchors)} locales encontrados en '{query}'")
 
-        # Buscar nombre del negocio (etiqueta h3 dentro del bloque)
-        name_tag = result.css('h3')
-        name = name_tag[0].get_text() if name_tag else 'Sin nombre'
-
-        # Buscar descripción
-        desc_tags = result.css('span, div')
-        description = ''
-        for d in desc_tags:
-            t = d.get_text(separator=' ').strip()
-            if len(t) > 30:
-                description = t[:200]
-                break
-
-        website = has_website(text) or has_website(href)
-
-        results.append({
-            'nombre': name,
-            'instagram': f"https://{instagram_url}",
-            'tiene_pagina_web': website,
-            'descripcion': description[:200],
-            'fuente': href,
-        })
-
-    return results
-
-
-def scrape_instagram_search_medellin() -> list[dict]:
-    """
-    Busca directamente en Instagram hashtags de restaurantes de Medellín.
-    Extrae perfiles que aparezcan en los resultados.
-    """
     results = []
-    hashtags = [
-        'restaurantesmedellin',
-        'foodmedellin',
-        'cafeteriamedellin',
-        'comidamedellin',
-        'baresdemedellin',
-    ]
-
-    for tag in hashtags:
-        url = f"https://www.instagram.com/explore/tags/{tag}/"
-        try:
-            page = StealthyFetcher.fetch(url, headless=True, network_idle=True)
-            # Extraer handles de Instagram del contenido
-            page_text = page.get_text(separator=' ')
-            handles = set(re.findall(r'@([A-Za-z0-9_.]{3,30})', page_text))
-
-            for handle in handles:
-                results.append({
-                    'nombre': handle,
-                    'instagram': f"https://www.instagram.com/{handle}/",
-                    'hashtag_origen': tag,
-                    'tiene_pagina_web': None,  # Se verifica después
-                })
-        except Exception as e:
-            print(f"[!] Error en hashtag #{tag}: {e}")
-        time.sleep(2)
+    for anchor in anchors:
+        name  = anchor.get_attribute('aria-label') or ''
+        href  = anchor.get_attribute('href') or ''
+        if not name:
+            continue
+        results.append({'nombre': name.strip(), 'maps_url': href})
 
     return results
 
 
-def verify_instagram_profile(handle: str) -> dict:
+def get_place_details(playwright_page, place: dict) -> dict:
     """
-    Visita el perfil de Instagram y verifica si tiene link de web externo.
+    Abre el panel de detalle de un local en Maps y extrae website e Instagram.
     """
-    url = f"https://www.instagram.com/{handle}/"
-    result = {'instagram': url, 'website_en_bio': False, 'website_url': ''}
+    place_url = place.get('maps_url', '')
+    if not place_url:
+        return place
+
+    playwright_page.goto(place_url, wait_until='domcontentloaded', timeout=20000)
+    playwright_page.wait_for_timeout(3000)
+
+    # Website propio
+    website = ''
+    web_link = playwright_page.query_selector('a[data-item-id="authority"]')
+    if web_link:
+        website = web_link.get_attribute('href') or ''
+
+    # Instagram: a veces aparece en el panel de detalle como link externo
+    instagram = ''
+    all_links = playwright_page.query_selector_all('a[href*="instagram.com"]')
+    if all_links:
+        instagram = all_links[0].get_attribute('href') or ''
+
+    # Texto completo de la página para buscar menciones de Instagram
+    if not instagram:
+        page_text = playwright_page.inner_text('body')
+        instagram = find_instagram(page_text)
+
+    place.update({
+        'website': website,
+        'instagram': instagram,
+        'tiene_pagina_web': bool(website and _is_own_website(website)),
+    })
+    return place
+
+
+# ─── Fase 2: Verificar Instagram por nombre vía búsqueda web ─────────────────
+
+def search_instagram_by_name(name: str) -> str:
+    """
+    Busca el Instagram de un local usando la API de DuckDuckGo JSON.
+    Menos bloqueada que el HTML de DDG.
+    """
+    import urllib.parse, urllib.request
+
+    query = urllib.parse.quote(f'site:instagram.com "{name}" medellin')
+    url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1"
     try:
-        page = StealthyFetcher.fetch(url, headless=True, network_idle=True)
-        page_text = page.get_text(separator=' ')
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        # AbstractURL puede contener el perfil
+        abstract_url = data.get('AbstractURL', '')
+        if 'instagram.com' in abstract_url:
+            return abstract_url
+        # Buscar en los RelatedTopics
+        for topic in data.get('RelatedTopics', []):
+            text = topic.get('Text', '') + ' ' + topic.get('FirstURL', '')
+            ig = find_instagram(text)
+            if ig:
+                return ig
+    except Exception:
+        pass
 
-        # Buscar link externo en la bio (suele aparecer como texto de enlace)
-        external_links = page.css('a[href*="http"]:not([href*="instagram.com"])')
-        for link in external_links:
-            href = link.attrib.get('href', '')
-            social_domains = ('facebook.', 'twitter.', 'tiktok.', 'youtube.', 'linktr.ee')
-            if href and not any(s in href.lower() for s in social_domains):
-                result['website_en_bio'] = True
-                result['website_url'] = href
-                break
+    # Fallback: buscar con Scrapling en Bing (sin SSL proxy issues)
+    try:
+        query2 = urllib.parse.quote(f'instagram.com {name} medellin')
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; Scrapling)'}
+        page = Fetcher.get(
+            f'https://www.bing.com/search?q={query2}',
+            headers=headers
+        )
+        return find_instagram(page.html_content)
+    except Exception:
+        pass
 
-        # Buscar linktree (cuenta como "tiene web")
-        if 'linktr.ee' in page_text or 'linktree' in page_text.lower():
-            result['website_en_bio'] = True
-            result['website_url'] = 'linktr.ee (intermediario)'
-
-    except Exception as e:
-        print(f"[!] Error verificando {handle}: {e}")
-
-    return result
-
-
-def guardar_csv(datos: list[dict], archivo: str = 'resultados.csv'):
-    if not datos:
-        return
-    keys = datos[0].keys()
-    with open(archivo, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(datos)
-    print(f"[+] Guardado: {archivo} ({len(datos)} registros)")
+    return ''
 
 
-def guardar_json(datos: list[dict], archivo: str = 'resultados.json'):
-    with open(archivo, 'w', encoding='utf-8') as f:
-        json.dump(datos, f, ensure_ascii=False, indent=2)
-    print(f"[+] Guardado: {archivo} ({len(datos)} registros)")
-
+# ─── Pipeline principal ───────────────────────────────────────────────────────
 
 def main():
-    print("=" * 60)
+    print("=" * 65)
     print("  Buscador: Instagram SIN página web — Medellín, Colombia")
-    print("=" * 60)
+    print("=" * 65)
 
-    todos = []
+    todos_locales: list[dict] = []
 
-    # --- Fase 1: Búsqueda en Google ---
-    print("\n[1/2] Buscando en Google Maps/Search...")
-    for query in SEARCH_QUERIES:
-        print(f"  -> '{query}'")
-        try:
-            r = scrape_google_maps_search(query)
-            todos.extend(r)
-            print(f"     {len(r)} resultados encontrados")
-        except Exception as e:
-            print(f"     Error: {e}")
-        time.sleep(3)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(ignore_https_errors=True)
+        page = ctx.new_page()
 
-    # --- Fase 2: Hashtags de Instagram ---
-    print("\n[2/2] Buscando por hashtags en Instagram...")
-    ig_results = scrape_instagram_search_medellin()
-    print(f"  -> {len(ig_results)} handles encontrados")
+        # ── Fase 1a: listar locales desde Maps ──────────────────────────
+        print("\n[1/3] Recopilando locales desde Google Maps...")
+        seen_names: set[str] = set()
+        raw_listings: list[dict] = []
 
-    # Verificar si cada perfil tiene web en su bio
-    sin_web = []
-    print("  -> Verificando bios de Instagram...")
-    seen = set()
-    for item in ig_results:
-        handle = item['nombre']
-        if handle in seen:
+        for query in SEARCH_QUERIES_MAPS:
+            listings = scrape_maps_listings(page, query)
+            for loc in listings:
+                key = loc['nombre'].lower().strip()
+                if key not in seen_names:
+                    seen_names.add(key)
+                    raw_listings.append(loc)
+
+        print(f"\n  Total únicos en Maps: {len(raw_listings)}")
+
+        # ── Fase 1b: obtener detalles (website / Instagram) ───────────────
+        print("\n[2/3] Revisando website e Instagram en Maps...")
+        for i, loc in enumerate(raw_listings, 1):
+            try:
+                loc = get_place_details(page, loc)
+            except Exception as e:
+                print(f"  [!] Error en '{loc['nombre']}': {e}")
+                loc.setdefault('website', '')
+                loc.setdefault('instagram', '')
+                loc.setdefault('tiene_pagina_web', False)
+
+            if i % 10 == 0:
+                print(f"  ... {i}/{len(raw_listings)} procesados")
+
+            todos_locales.append(loc)
+
+        browser.close()
+
+    # ── Fase 2: para los sin web, buscar Instagram si aún no lo tiene ──
+    print("\n[3/3] Buscando Instagram de locales sin web...")
+    sin_web = [r for r in todos_locales if not r.get('tiene_pagina_web')]
+    print(f"  Locales sin web: {len(sin_web)}")
+
+    for loc in sin_web:
+        if loc.get('instagram'):
             continue
-        seen.add(handle)
+        ig = search_instagram_by_name(loc['nombre'])
+        if ig:
+            loc['instagram'] = ig
+        time.sleep(0.8)
 
-        verificacion = verify_instagram_profile(handle)
-        if not verificacion['website_en_bio']:
-            sin_web.append({
-                'nombre': handle,
-                'instagram': item['instagram'],
-                'tiene_pagina_web': False,
-                'hashtag_origen': item['hashtag_origen'],
-                'descripcion': '',
-            })
-        time.sleep(1.5)
+    # ── Resultado final: sin web Y CON Instagram ──────────────────────
+    resultado_final = [
+        r for r in sin_web
+        if r.get('instagram') and 'instagram.com' in r.get('instagram', '')
+    ]
 
-    todos.extend(sin_web)
+    print(f"\n{'=' * 65}")
+    print(f"  TOTAL: locales con Instagram pero SIN página web: {len(resultado_final)}")
+    print(f"{'=' * 65}\n")
 
-    # --- Filtrar: solo los que NO tienen web ---
-    solo_instagram = [r for r in todos if not r.get('tiene_pagina_web')]
+    for i, r in enumerate(resultado_final, 1):
+        print(f"  {i:3}. {r['nombre']:<40} {r['instagram']}")
 
-    # Deduplicar por instagram URL
-    vistos = set()
-    unicos = []
-    for r in solo_instagram:
-        key = r.get('instagram', '').lower().strip('/')
-        if key and key not in vistos:
-            vistos.add(key)
-            unicos.append(r)
+    guardar_csv(resultado_final)
+    guardar_json(resultado_final)
 
-    print(f"\n{'=' * 60}")
-    print(f"  TOTAL locales con Instagram pero SIN web: {len(unicos)}")
-    print(f"{'=' * 60}\n")
+    # Resumen adicional: los que tienen web (para contexto)
+    con_web = [r for r in todos_locales if r.get('tiene_pagina_web')]
+    print(f"\n  (Para referencia: {len(con_web)} locales SÍ tienen página web propia)")
 
-    for i, r in enumerate(unicos[:20], 1):
-        print(f"  {i:2}. {r.get('nombre', 'N/A'):<30} {r.get('instagram', '')}")
 
-    if len(unicos) > 20:
-        print(f"  ... y {len(unicos) - 20} más (ver archivos de salida)")
+# ─── Guardado ─────────────────────────────────────────────────────────────────
 
-    guardar_csv(unicos, 'resultados.csv')
-    guardar_json(unicos, 'resultados.json')
+def guardar_csv(datos: list[dict]):
+    if not datos:
+        print("  [!] Sin datos para guardar en CSV")
+        return
+    keys = ['nombre', 'instagram', 'website', 'maps_url']
+    with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(datos)
+    print(f"\n[+] CSV guardado: {OUTPUT_CSV}  ({len(datos)} registros)")
+
+
+def guardar_json(datos: list[dict]):
+    with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
+        json.dump(datos, f, ensure_ascii=False, indent=2)
+    print(f"[+] JSON guardado: {OUTPUT_JSON}  ({len(datos)} registros)")
 
 
 if __name__ == '__main__':
